@@ -2,6 +2,10 @@ import os
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+import base64
+import hashlib
+import secrets
+import urllib.parse
 
 from preop_ai_mvp_app_v3 import (
     call_openai,
@@ -43,10 +47,26 @@ from cancellation_module import build_cancellation_module
 
 load_dotenv()
 
+load_dotenv()
+
+EPIC_CLIENT_ID = st.secrets.get("EPIC_CLIENT_ID", "")
+EPIC_REDIRECT_URI = st.secrets.get("EPIC_REDIRECT_URI", "")
+EPIC_FHIR_BASE_URL = st.secrets.get(
+    "EPIC_FHIR_BASE_URL",
+    "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
+)
+
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+
+EPIC_AUTH_URL = "https://fhir.epic.com/interconnect-fhir-oauth/oauth2/authorize"
+EPIC_TOKEN_URL = "https://fhir.epic.com/interconnect-fhir-oauth/oauth2/token"
+
 st.set_page_config(page_title="Preop AI FHIR Sandbox", layout="wide")
 
 st.title("Preop AI — FHIR Sandbox Dashboard")
 st.warning("Sandbox only. Do not use real PHI.")
+st.info(f"EPIC_CLIENT_ID loaded? {'YES' if EPIC_CLIENT_ID else 'NO'}")
+st.info(f"EPIC_REDIRECT_URI loaded? {'YES' if EPIC_REDIRECT_URI else 'NO'}")
 
 
 def bundle_to_preop_text(bundle):
@@ -90,6 +110,53 @@ def bundle_to_preop_text(bundle):
     return "\n".join(lines)
 
 
+def make_pkce_pair():
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+    return verifier, challenge
+
+
+def build_epic_authorize_url():
+    code_verifier, code_challenge = make_pkce_pair()
+    state = secrets.token_urlsafe(32)
+
+    st.session_state.code_verifier = code_verifier
+    st.session_state.oauth_state = state
+
+    params = {
+        "response_type": "code",
+        "client_id": EPIC_CLIENT_ID,
+        "redirect_uri": EPIC_REDIRECT_URI,
+        "scope": "launch/patient patient/*.read openid fhirUser",
+        "state": state,
+        "aud": EPIC_FHIR_BASE_URL,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+
+    return EPIC_AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+
+def exchange_code_for_token(code):
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": EPIC_REDIRECT_URI,
+        "client_id": EPIC_CLIENT_ID,
+        "code_verifier": st.session_state.get("code_verifier", ""),
+    }
+
+    response = requests.post(EPIC_TOKEN_URL, data=data, timeout=20)
+
+    if response.status_code != 200:
+        raise Exception(f"Token exchange failed: {response.status_code} {response.text}")
+
+    return response.json()
+
+
+
+
 def run_full_preop_engine(preop_text):
     result = call_openai(preop_text, os.getenv("OPENAI_API_KEY"))
 
@@ -106,14 +173,45 @@ def run_full_preop_engine(preop_text):
 
     return result
 
+st.subheader("Epic SMART OAuth Test")
 
+if not EPIC_CLIENT_ID or not EPIC_REDIRECT_URI:
+    st.warning("Missing EPIC_CLIENT_ID or EPIC_REDIRECT_URI in Streamlit secrets.")
+else:
+    auth_url = build_epic_authorize_url()
+    st.link_button("Connect to Epic Sandbox", auth_url)
+
+query_params = st.query_params
+
+if "code" in query_params:
+    code = query_params.get("code")
+    returned_state = query_params.get("state")
+
+    if returned_state != st.session_state.get("oauth_state"):
+        st.error("OAuth state mismatch. Restart login.")
+    else:
+        try:
+            token_response = exchange_code_for_token(code)
+
+            st.session_state.epic_access_token = token_response.get("access_token")
+            st.session_state.epic_patient_id = token_response.get("patient")
+            st.session_state.epic_token_response = token_response
+
+            st.success("Epic OAuth token received.")
+            st.write("Epic patient ID:", st.session_state.epic_patient_id)
+
+        except Exception as e:
+            st.error(str(e))
+            
 FHIR_BASE_URL = st.text_input(
     "FHIR Base URL",
     value=os.getenv("FHIR_BASE_URL", "https://r4.smarthealthit.org")
 )
 
-patient_id = st.text_input("Sandbox Patient ID", value=os.getenv("PATIENT_ID", ""))
-
+patient_id = st.session_state.get("epic_patient_id") or st.text_input(
+    "Sandbox Patient ID",
+    value=os.getenv("PATIENT_ID", "")
+)
 st.divider()
 
 col_a, col_b, col_c = st.columns(3)
@@ -132,7 +230,32 @@ if fetch_bundle:
         st.error("Enter a sandbox patient ID first.")
         st.stop()
 
-   
+    resources = {
+        "Patient": f"{FHIR_BASE_URL}/Patient/{patient_id}",
+        "Conditions": f"{FHIR_BASE_URL}/Condition?patient={patient_id}&_count=20",
+        "Medications": f"{FHIR_BASE_URL}/MedicationRequest?patient={patient_id}&_count=20",
+        "Allergies": f"{FHIR_BASE_URL}/AllergyIntolerance?patient={patient_id}&_count=20",
+        "Observations / Labs": f"{FHIR_BASE_URL}/Observation?patient={patient_id}&_count=30",
+        "Procedures": f"{FHIR_BASE_URL}/Procedure?patient={patient_id}&_count=20",
+        "Diagnostic Reports": f"{FHIR_BASE_URL}/DiagnosticReport?patient={patient_id}&_count=20",
+    }
+
+    preop_bundle = {}
+
+    with st.spinner("Fetching FHIR preop bundle..."):
+        for name, url in resources.items():
+            response = requests.get(url, timeout=20)
+
+            if response.status_code == 200:
+                preop_bundle[name] = response.json()
+            else:
+                preop_bundle[name] = {"error": response.text}
+
+    st.session_state.preop_bundle = preop_bundle
+    st.session_state.preop_text = bundle_to_preop_text(preop_bundle)
+    st.success("FHIR preop bundle fetched and converted.")
+
+
 if search_patients:
     url = f"{FHIR_BASE_URL}/Patient?_count=5"
 
@@ -178,74 +301,35 @@ if test_patient:
         st.error(str(e))
 
 
-
-
-    resources = {
-        "Patient": f"{FHIR_BASE_URL}/Patient/{patient_id}",
-        "Conditions": f"{FHIR_BASE_URL}/Condition?patient={patient_id}&_count=20",
-        "Medications": f"{FHIR_BASE_URL}/MedicationRequest?patient={patient_id}&_count=20",
-        "Allergies": f"{FHIR_BASE_URL}/AllergyIntolerance?patient={patient_id}&_count=20",
-        "Observations / Labs": f"{FHIR_BASE_URL}/Observation?patient={patient_id}&_count=30",
-        "Procedures": f"{FHIR_BASE_URL}/Procedure?patient={patient_id}&_count=20",
-        "Diagnostic Reports": f"{FHIR_BASE_URL}/DiagnosticReport?patient={patient_id}&_count=20",
-    }
-
-    preop_bundle = {}
-
-    for name, url in resources.items():
-        response = requests.get(url, timeout=20)
-
-        if response.status_code == 200:
-            preop_bundle[name] = response.json()
-        else:
-            preop_bundle[name] = {"error": response.text}
-
-    # ✅ SAVE
-    st.session_state.preop_bundle = preop_bundle
-    st.session_state.preop_text = bundle_to_preop_text(preop_bundle)
-    st.success("FHIR preop bundle fetched and converted.")
-
-
 if "preop_bundle" in st.session_state:
-
     st.divider()
-
     st.subheader("Combined Preop FHIR Bundle")
-
     st.json(st.session_state.preop_bundle)
 
     st.divider()
-
-    st.subheader("Preop AI Input Text")
-
     st.subheader("Preop AI Input Text")
 
     st.text_area(
         "FHIR converted to Preop AI input",
         value=st.session_state.preop_text,
         height=400,
-        key="fhir_preop_text_area" 
+        key="fhir_preop_text_area"
     )
 
-
     st.divider()
-
     st.subheader("Full Preop AI Dashboard")
 
-if st.button("Analyze FHIR Patient with Full Dashboard", key="analyze_fhir_full_dashboard_btn"):
+    if st.button("Analyze FHIR Patient with Full Dashboard", key="analyze_fhir_full_dashboard_btn"):
         try:
-
             with st.spinner("Running full Preop AI engine..."):
-
                 result = run_full_preop_engine(st.session_state.preop_text)
-
                 st.session_state.result = result
 
             st.success("Full Preop AI dashboard generated.")
 
         except Exception as e:
-
             st.error(str(e))
+
 
 if "result" in st.session_state:
     result = st.session_state.result
@@ -330,12 +414,11 @@ if "result" in st.session_state:
         epic_note_text = build_epic_note_text(result)
 
         st.text_area(
-        "Copy/paste draft note",
-         value=epic_note_text,
-         height=500,
-        key="epic_note_text_area"  
+            "Copy/paste draft note",
+            value=epic_note_text,
+            height=500,
+            key="epic_note_text_area"
         )
-        
 
         st.download_button(
             "Download Epic-Style Note",
