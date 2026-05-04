@@ -65,8 +65,7 @@ st.set_page_config(page_title="Preop AI FHIR Sandbox", layout="wide")
 
 st.title("Preop AI — FHIR Sandbox Dashboard")
 st.warning("Sandbox only. Do not use real PHI.")
-st.info(f"EPIC_CLIENT_ID loaded? {'YES' if EPIC_CLIENT_ID else 'NO'}")
-st.info(f"EPIC_REDIRECT_URI loaded? {'YES' if EPIC_REDIRECT_URI else 'NO'}")
+
 
 
 def bundle_to_preop_text(bundle):
