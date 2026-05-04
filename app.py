@@ -316,13 +316,28 @@ if "preop_bundle" in st.session_state:
         key="fhir_preop_text_area"
     )
 
+    
+    st.subheader("Procedure / Anesthesia Context")
+
+    procedure_context = st.text_area(
+        "Add procedure / anesthesia context",
+        value="Scheduled procedure: not documented",
+        height=100
+    )
+
+    combined_preop_text = (
+        st.session_state.preop_text +
+        "\n\nProcedure Context:\n" +
+        procedure_context
+    )
+
     st.divider()
     st.subheader("Full Preop AI Dashboard")
 
     if st.button("Analyze FHIR Patient with Full Dashboard", key="analyze_fhir_full_dashboard_btn"):
         try:
             with st.spinner("Running full Preop AI engine..."):
-                result = run_full_preop_engine(st.session_state.preop_text)
+                result = run_full_preop_engine(combined_preop_text)  # 👈 CHANGE HERE
                 st.session_state.result = result
 
             st.success("Full Preop AI dashboard generated.")
